@@ -47,7 +47,7 @@ Not in P0: automatic merge, automatic issue transitions, a web UI, active/active
 - Git 2.31+
 - Network access from the scheduler host to the GitLab API
 - For local execution: repository credentials and a non-interactive coding-agent command on the scheduler host
-- For SSH execution: Python, this package, Git, repository credentials, and `csc`/the configured agent command on each execution host
+- For SSH execution: a POSIX-like host, Python, this package, Git, repository credentials, and `csc`/the configured agent command (local execution remains cross-platform)
 - OpenSSH client on the scheduler server and key-based, host-key-verified access to remote targets
 
 ## Install
@@ -108,6 +108,8 @@ An active Issue with `agent-host::build-01` runs on `build-01`; an active Issue 
 Provision a dedicated, non-login automation account where practical. Populate `known_hosts` ahead of time; host-key checking is strict and non-interactive. Install repository and CSC credentials on the execution host itself. The scheduler's GitLab tracker token is not sent to the remote helper.
 
 The SSH command contains only administrator-owned configuration. A versioned JSON request carrying the Issue, prompt, and typed operation is sent on stdin to `gitlab_issue_agent.remote_runner`, which launches Git and CSC with argument arrays rather than a shell. OpenSSH necessarily represents the fixed remote helper argv as a quoted command string, but no Issue-controlled data is included in it.
+
+P0 quotes that fixed helper command with POSIX shell rules and validates SSH execution on Linux. A Windows machine can still be a local target; Windows OpenSSH execution-host command quoting is not claimed in this release.
 
 Changing the placement label cancels the current executor and then creates/reuses a workspace on the new host. Native session IDs are host-scoped and are cleared on that move. Uncommitted files are not copied between targets, so the workflow should push durable checkpoints before an operator deliberately reroutes an Issue.
 

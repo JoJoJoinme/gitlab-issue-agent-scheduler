@@ -155,6 +155,7 @@ The scheduler records the command shape but redacts the complete prompt argument
 - P0 has one scheduler process, though execution spans hosts. The local file lock is not an active/active scheduler lease.
 - Remote leases contain executor birth identity; they are not job-ownership leases for multiple schedulers.
 - An unreachable execution host intentionally leaves its Issue `BLOCKED`. Operator recovery means restoring SSH/reaper reachability or proving and cleaning the execution state on that host, not deleting the local state record.
+- P0 SSH execution targets are POSIX-like; the fixed remote helper argv uses POSIX quoting. Scheduler/local targets remain cross-platform, but Windows OpenSSH execution-host quoting needs a separate verified transport mode.
 - Git operations can still be interrupted between directory creation and metadata persistence; reuse validation fails closed on a non-worktree path.
 - Polling cannot cancel faster than the configured interval.
 - Automatic MR creation is agent workflow behavior, not orchestrator behavior.
