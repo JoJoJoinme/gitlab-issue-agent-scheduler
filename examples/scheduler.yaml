@@ -39,6 +39,37 @@ agent:
   pass_env: [HTTPS_PROXY, HTTP_PROXY, NO_PROXY]
   env: {}
 
+# The scheduler stays on the control-plane server. Each Issue is placed on an
+# execution target by an optional `agent-host::<target-id>` GitLab label.
+# With no placement label, `default_target` is used.
+execution:
+  default_target: scheduler-local
+  label_prefix: "agent-host::"
+  targets:
+    scheduler-local:
+      kind: local
+      max_concurrent_agents: 1
+
+    build-01:
+      kind: ssh
+      max_concurrent_agents: 2
+      # This state, including worktrees and attempt leases, lives on build-01.
+      remote_state_root: /var/lib/gitlab-issue-agent
+      ssh:
+        host: build-01.internal.example
+        user: issue-agent
+        port: 22
+        identity_file: /etc/gitlab-issue-agent/ssh/id_ed25519
+        known_hosts_file: /etc/gitlab-issue-agent/ssh/known_hosts
+        connect_timeout_seconds: 10
+        # Install this package in the same venv on the execution host.
+        remote_command:
+          ["/opt/gitlab-issue-agent/venv/bin/python", "-m", "gitlab_issue_agent.remote_runner"]
+      # repository and agent inherit the global settings above. Override only
+      # host-specific values. This host launches csc itself, not on the server.
+      agent:
+        command: csc
+
 continuation:
   delay_seconds: 1
   max_consecutive: 20

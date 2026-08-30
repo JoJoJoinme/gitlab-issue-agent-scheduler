@@ -71,9 +71,16 @@ class CommandAgentBackend(AgentBackend):
         "PROGRAMDATA",
     }
 
-    def __init__(self, config: AgentConfig, *, process_guard: type[ProcessGuard] = ProcessGuard):
+    def __init__(
+        self,
+        config: AgentConfig,
+        *,
+        process_guard: type[ProcessGuard] = ProcessGuard,
+        host_id: str = "local",
+    ):
         self.config = config
         self.process_guard = process_guard
+        self.host_id = host_id
 
     @property
     def supports_native_resume(self) -> bool:
@@ -129,7 +136,9 @@ class CommandAgentBackend(AgentBackend):
         identity: ProcessIdentity | None = None
         try:
             try:
-                identity = self.process_guard.capture(process.pid, context.attempt_id)
+                identity = self.process_guard.capture(
+                    process.pid, context.attempt_id, host_id=self.host_id
+                )
                 await callbacks.process_started(identity)
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 await callbacks.emit("agent.process_identity_unavailable", {"pid": process.pid})

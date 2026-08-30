@@ -91,6 +91,129 @@ class AgentConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class SSHConfig:
+    host: str
+    user: str | None = None
+    port: int = 22
+    executable: str = "ssh"
+    identity_file: Path | None = None
+    known_hosts_file: Path | None = None
+    connect_timeout_seconds: float = 10.0
+    server_alive_interval_seconds: int = 15
+    server_alive_count_max: int = 3
+    options: tuple[str, ...] = ()
+    remote_command: tuple[str, ...] = (
+        "python3",
+        "-m",
+        "gitlab_issue_agent.remote_runner",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionTargetConfig:
+    id: str
+    kind: str
+    repository: RepositoryConfig
+    agent: AgentConfig
+    max_concurrent_agents: int
+    remote_state_root: str | None = None
+    ssh: SSHConfig | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionConfig:
+    default_target: str
+    label_prefix: str
+    targets: dict[str, ExecutionTargetConfig]
+
+    def target(self, target_id: str) -> ExecutionTargetConfig:
+        try:
+            return self.targets[target_id]
+        except KeyError as error:
+            raise ConfigError(f"unknown execution target: {target_id}") from error
+
+
+_TARGET_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _repository_config(raw: dict[str, Any], *, name: str) -> RepositoryConfig:
+    if not raw.get("clone_url"):
+        raise ConfigError(f"{name}.clone_url is required")
+    return RepositoryConfig(
+        clone_url=str(raw["clone_url"]),
+        default_branch=str(raw.get("default_branch", "main")),
+        branch_prefix=str(raw.get("branch_prefix", "agent/issue-")),
+        fetch_on_create=bool(raw.get("fetch_on_create", True)),
+    )
+
+
+def _agent_config(raw: dict[str, Any], *, name: str) -> AgentConfig:
+    if not raw.get("command"):
+        raise ConfigError(f"{name}.command is required")
+    args = _string_list(raw.get("args", ["-p", "{prompt}"]), f"{name}.args")
+    resume_args = _string_list(raw.get("native_resume_args", []), f"{name}.native_resume_args")
+    if not any("{prompt}" in item for item in args):
+        raise ConfigError(f"{name}.args must contain a {{prompt}} placeholder")
+    if resume_args and (
+        not any("{prompt}" in item for item in resume_args)
+        or not any("{session_id}" in item for item in resume_args)
+    ):
+        raise ConfigError(
+            f"{name}.native_resume_args must contain {{session_id}} and {{prompt}} placeholders"
+        )
+    agent_env = raw.get("env", {})
+    if not isinstance(agent_env, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str) for key, value in agent_env.items()
+    ):
+        raise ConfigError(f"{name}.env must be a string-to-string mapping")
+    return AgentConfig(
+        command=str(raw["command"]),
+        args=tuple(args),
+        native_resume_args=tuple(resume_args),
+        prefer_native_resume=bool(raw.get("prefer_native_resume", True)),
+        output_format=str(raw.get("output_format", "auto")),
+        session_id_paths=tuple(
+            _string_list(
+                raw.get("session_id_paths", ["session_id", "session.id"]),
+                f"{name}.session_id_paths",
+            )
+        ),
+        timeout_seconds=float(raw.get("timeout_seconds", 3600)),
+        cancel_grace_seconds=float(raw.get("cancel_grace_seconds", 5)),
+        pass_env=tuple(_string_list(raw.get("pass_env", []), f"{name}.pass_env")),
+        env=dict(agent_env),
+        summary_chars=int(raw.get("summary_chars", 8000)),
+    )
+
+
+def _ssh_config(raw: dict[str, Any], *, base: Path, name: str) -> SSHConfig:
+    host = str(raw.get("host", "")).strip()
+    if not host or any(character.isspace() for character in host):
+        raise ConfigError(f"{name}.host must be a non-empty host name without whitespace")
+    remote_command = _string_list(
+        raw.get("remote_command", ["python3", "-m", "gitlab_issue_agent.remote_runner"]),
+        f"{name}.remote_command",
+    )
+    if not remote_command:
+        raise ConfigError(f"{name}.remote_command must not be empty")
+    identity = raw.get("identity_file")
+    known_hosts = raw.get("known_hosts_file")
+    return SSHConfig(
+        host=host,
+        user=str(raw["user"]) if raw.get("user") else None,
+        port=int(raw.get("port", 22)),
+        executable=str(raw.get("executable", "ssh")),
+        identity_file=_path(base, identity) if identity else None,
+        known_hosts_file=_path(base, known_hosts) if known_hosts else None,
+        connect_timeout_seconds=float(raw.get("connect_timeout_seconds", 10)),
+        server_alive_interval_seconds=int(raw.get("server_alive_interval_seconds", 15)),
+        server_alive_count_max=int(raw.get("server_alive_count_max", 3)),
+        options=tuple(_string_list(raw.get("options", []), f"{name}.options")),
+        remote_command=tuple(remote_command),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class RetryConfig:
     initial_seconds: float = 10.0
     max_seconds: float = 300.0
@@ -118,6 +241,7 @@ class SchedulerConfig:
     tracker: GitLabConfig
     repository: RepositoryConfig
     agent: AgentConfig
+    execution: ExecutionConfig
     retry: RetryConfig
     continuation: ContinuationConfig
     stdout_events: bool = True
@@ -148,6 +272,7 @@ class SchedulerConfig:
         retry_raw = raw.get("retry", {})
         continuation_raw = raw.get("continuation", {})
         observability_raw = raw.get("observability", {})
+        execution_raw = raw.get("execution", {})
 
         for name, value in (
             ("tracker", tracker_raw),
@@ -157,6 +282,7 @@ class SchedulerConfig:
             ("retry", retry_raw),
             ("continuation", continuation_raw),
             ("observability", observability_raw),
+            ("execution", execution_raw),
         ):
             if not isinstance(value, dict):
                 raise ConfigError(f"{name} must be a mapping")
@@ -170,27 +296,6 @@ class SchedulerConfig:
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise ConfigError("missing required configuration: " + ", ".join(missing))
-
-        args = _string_list(agent_raw.get("args", ["-p", "{prompt}"]), "agent.args")
-        resume_args = _string_list(
-            agent_raw.get("native_resume_args", []), "agent.native_resume_args"
-        )
-        if not any("{prompt}" in item for item in args):
-            raise ConfigError("agent.args must contain a {prompt} placeholder")
-        if resume_args and (
-            not any("{prompt}" in item for item in resume_args)
-            or not any("{session_id}" in item for item in resume_args)
-        ):
-            raise ConfigError(
-                "agent.native_resume_args must contain {session_id} and {prompt} placeholders"
-            )
-
-        agent_env = agent_raw.get("env", {})
-        if not isinstance(agent_env, dict) or any(
-            not isinstance(key, str) or not isinstance(value, str)
-            for key, value in agent_env.items()
-        ):
-            raise ConfigError("agent.env must be a string-to-string mapping")
 
         tracker = GitLabConfig(
             base_url=str(tracker_raw.get("base_url", "https://gitlab.com")).rstrip("/"),
@@ -219,30 +324,8 @@ class SchedulerConfig:
             per_page=int(tracker_raw.get("per_page", 100)),
             request_timeout_seconds=float(tracker_raw.get("request_timeout_seconds", 20)),
         )
-        repository = RepositoryConfig(
-            clone_url=str(repo_raw["clone_url"]),
-            default_branch=str(repo_raw.get("default_branch", "main")),
-            branch_prefix=str(repo_raw.get("branch_prefix", "agent/issue-")),
-            fetch_on_create=bool(repo_raw.get("fetch_on_create", True)),
-        )
-        agent = AgentConfig(
-            command=str(agent_raw["command"]),
-            args=tuple(args),
-            native_resume_args=tuple(resume_args),
-            prefer_native_resume=bool(agent_raw.get("prefer_native_resume", True)),
-            output_format=str(agent_raw.get("output_format", "auto")),
-            session_id_paths=tuple(
-                _string_list(
-                    agent_raw.get("session_id_paths", ["session_id", "session.id"]),
-                    "agent.session_id_paths",
-                )
-            ),
-            timeout_seconds=float(agent_raw.get("timeout_seconds", 3600)),
-            cancel_grace_seconds=float(agent_raw.get("cancel_grace_seconds", 5)),
-            pass_env=tuple(_string_list(agent_raw.get("pass_env", []), "agent.pass_env")),
-            env=dict(agent_env),
-            summary_chars=int(agent_raw.get("summary_chars", 8000)),
-        )
+        repository = _repository_config(repo_raw, name="repository")
+        agent = _agent_config(agent_raw, name="agent")
         retry = RetryConfig(
             initial_seconds=float(retry_raw.get("initial_seconds", 10)),
             max_seconds=float(retry_raw.get("max_seconds", 300)),
@@ -254,6 +337,75 @@ class SchedulerConfig:
             yield_seconds=float(continuation_raw.get("yield_seconds", 30)),
         )
 
+        targets_raw = execution_raw.get("targets")
+        if targets_raw is None:
+            targets_raw = {
+                "local": {
+                    "kind": "local",
+                    "max_concurrent_agents": scheduler_raw.get("max_concurrent_agents", 4),
+                }
+            }
+        if not isinstance(targets_raw, dict) or not targets_raw:
+            raise ConfigError("execution.targets must be a non-empty mapping")
+        targets: dict[str, ExecutionTargetConfig] = {}
+        for target_id, target_raw in targets_raw.items():
+            if not isinstance(target_id, str) or not _TARGET_ID_PATTERN.fullmatch(target_id):
+                raise ConfigError("execution target ids must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+            if not isinstance(target_raw, dict):
+                raise ConfigError(f"execution.targets.{target_id} must be a mapping")
+            kind = str(target_raw.get("kind", "local")).casefold()
+            if kind not in {"local", "ssh"}:
+                raise ConfigError(f"execution.targets.{target_id}.kind must be local or ssh")
+            repo_override = target_raw.get("repository", {})
+            agent_override = target_raw.get("agent", {})
+            if not isinstance(repo_override, dict) or not isinstance(agent_override, dict):
+                raise ConfigError(
+                    f"execution.targets.{target_id}.repository and agent must be mappings"
+                )
+            target_repository = _repository_config(
+                {**repo_raw, **repo_override},
+                name=f"execution.targets.{target_id}.repository",
+            )
+            target_agent = _agent_config(
+                {**agent_raw, **agent_override},
+                name=f"execution.targets.{target_id}.agent",
+            )
+            ssh: SSHConfig | None = None
+            remote_state_root: str | None = None
+            if kind == "ssh":
+                ssh_raw = target_raw.get("ssh", {})
+                if not isinstance(ssh_raw, dict):
+                    raise ConfigError(f"execution.targets.{target_id}.ssh must be a mapping")
+                ssh = _ssh_config(
+                    ssh_raw,
+                    base=base,
+                    name=f"execution.targets.{target_id}.ssh",
+                )
+                remote_state_root = str(target_raw.get("remote_state_root", "")).strip()
+                if not remote_state_root:
+                    raise ConfigError(
+                        f"execution.targets.{target_id}.remote_state_root is required for ssh"
+                    )
+            targets[target_id] = ExecutionTargetConfig(
+                id=target_id,
+                kind=kind,
+                repository=target_repository,
+                agent=target_agent,
+                max_concurrent_agents=int(
+                    target_raw.get(
+                        "max_concurrent_agents",
+                        scheduler_raw.get("max_concurrent_agents", 4),
+                    )
+                ),
+                remote_state_root=remote_state_root,
+                ssh=ssh,
+            )
+        execution = ExecutionConfig(
+            default_target=str(execution_raw.get("default_target", next(iter(targets)))),
+            label_prefix=str(execution_raw.get("label_prefix", "agent-host::")),
+            targets=targets,
+        )
+
         config = cls(
             config_path=config_path,
             state_root=_path(base, scheduler_raw.get("state_root", ".scheduler")),
@@ -263,6 +415,7 @@ class SchedulerConfig:
             tracker=tracker,
             repository=repository,
             agent=agent,
+            execution=execution,
             retry=retry,
             continuation=continuation,
             stdout_events=bool(observability_raw.get("stdout_json", True)),
@@ -285,3 +438,26 @@ class SchedulerConfig:
             raise ConfigError("agent timeout settings are invalid")
         if self.agent.output_format not in {"auto", "jsonl", "text"}:
             raise ConfigError("agent.output_format must be auto, jsonl, or text")
+        if self.execution.default_target not in self.execution.targets:
+            raise ConfigError("execution.default_target must name a configured target")
+        if not self.execution.label_prefix:
+            raise ConfigError("execution.label_prefix must not be empty")
+        for target in self.execution.targets.values():
+            if target.max_concurrent_agents <= 0:
+                raise ConfigError(
+                    f"execution target {target.id} max_concurrent_agents must be positive"
+                )
+            if target.agent.timeout_seconds <= 0 or target.agent.cancel_grace_seconds < 0:
+                raise ConfigError(
+                    f"execution target {target.id} agent timeout settings are invalid"
+                )
+            if target.agent.output_format not in {"auto", "jsonl", "text"}:
+                raise ConfigError(f"execution target {target.id} agent.output_format is invalid")
+            if target.kind == "ssh":
+                assert target.ssh is not None
+                if not 1 <= target.ssh.port <= 65535:
+                    raise ConfigError(f"execution target {target.id} ssh.port is invalid")
+                if target.ssh.connect_timeout_seconds <= 0:
+                    raise ConfigError(
+                        f"execution target {target.id} ssh.connect_timeout_seconds must be positive"
+                    )

@@ -24,7 +24,8 @@ class WorkspaceManager:
         self.workspaces_root = state_root / "workspaces"
         self._lock = asyncio.Lock()
 
-    async def ensure(self, issue: Issue) -> WorkspaceInfo:
+    async def ensure(self, issue: Issue, *, attempt_id: str | None = None) -> WorkspaceInfo:
+        del attempt_id  # Local process identity is captured by the backend.
         async with self._lock:
             await self._ensure_control_repo()
             path = self.workspaces_root / workspace_key(issue.identifier)
@@ -59,7 +60,8 @@ class WorkspaceManager:
             )
             return WorkspaceInfo(path=path, branch=branch, created_now=True)
 
-    async def snapshot(self, path: Path, *, max_chars: int = 12000) -> str:
+    async def snapshot(self, path: str | Path, *, max_chars: int = 12000) -> str:
+        path = Path(path)
         if not path.exists() or not await self._is_worktree(path):
             return "workspace is absent or not a git worktree"
         commands = [

@@ -8,14 +8,13 @@ from pathlib import Path
 
 from filelock import FileLock, Timeout
 
-from .backend import CommandAgentBackend
 from .config import ConfigError, SchedulerConfig
 from .events import EventSink
+from .execution import build_execution_router
 from .orchestrator import Orchestrator
 from .prompts import PromptBuilder
 from .state import StateStore
 from .tracker import GitLabIssueTracker
-from .workspace import WorkspaceManager
 
 
 def build_orchestrator(config: SchedulerConfig) -> Orchestrator:
@@ -24,8 +23,7 @@ def build_orchestrator(config: SchedulerConfig) -> Orchestrator:
     return Orchestrator(
         config,
         tracker=GitLabIssueTracker(config.tracker),
-        workspace=WorkspaceManager(config.state_root, config.repository),
-        backend=CommandAgentBackend(config.agent),
+        execution=build_execution_router(config),
         state=state,
         events=events,
         prompts=PromptBuilder(config.workflow_file),

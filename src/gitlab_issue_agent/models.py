@@ -31,6 +31,7 @@ class LocalPhase(StrEnum):
     RUNNING = "running"
     CONTINUATION_WAIT = "continuation_wait"
     RETRY_WAIT = "retry_wait"
+    BLOCKED = "blocked"
     RELEASED = "released"
 
 
@@ -58,7 +59,9 @@ class Issue:
 
 @dataclass(frozen=True, slots=True)
 class WorkspaceInfo:
-    path: Path
+    # Remote POSIX paths must not be normalized by pathlib on a Windows
+    # scheduler, so execution targets may return an opaque string here.
+    path: str | Path
     branch: str
     created_now: bool
 
@@ -68,6 +71,7 @@ class ProcessIdentity:
     pid: int
     create_time: float
     attempt_id: str
+    host_id: str = "local"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -94,6 +98,17 @@ class AgentResult:
     summary: str
     error: str | None = None
     duration_seconds: float = 0.0
+    # False means the transport lost contact and could not prove that the
+    # execution-plane process stopped. The control plane must not redispatch.
+    executor_safe: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class ReapResult:
+    confirmed_safe: bool
+    identity_matched: bool = False
+    terminated: bool = False
+    error: str | None = None
 
 
 @dataclass(slots=True)
@@ -105,6 +120,7 @@ class IssueState:
     phase: LocalPhase = LocalPhase.READY
     tracker_state: str = ""
     tracker_labels: list[str] = field(default_factory=list)
+    execution_target: str | None = None
     workspace_path: str | None = None
     branch: str | None = None
     total_attempts: int = 0

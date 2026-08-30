@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Any
 from .backend import AgentBackend, BackendCallbacks
 from .config import SchedulerConfig
 from .events import EventSink
+from .execution import ExecutionRouter, ExecutionTarget, PlacementError
 from .models import (
     AgentResult,
     AttemptContext,
@@ -31,6 +33,7 @@ from .workspace import WorkspaceManager
 @dataclass(slots=True)
 class RunningEntry:
     issue: Issue
+    target_id: str
     cancel_event: asyncio.Event
     task: asyncio.Task[None]
     cancel_reason: str | None = None
@@ -56,8 +59,9 @@ class Orchestrator:
         config: SchedulerConfig,
         *,
         tracker: IssueTracker,
-        workspace: WorkspaceManager,
-        backend: AgentBackend,
+        workspace: WorkspaceManager | None = None,
+        backend: AgentBackend | None = None,
+        execution: ExecutionRouter | None = None,
         state: StateStore,
         events: EventSink,
         prompts: PromptBuilder,
@@ -65,8 +69,21 @@ class Orchestrator:
     ) -> None:
         self.config = config
         self.tracker = tracker
-        self.workspace = workspace
-        self.backend = backend
+        if execution is None:
+            if workspace is None or backend is None:
+                raise ValueError("workspace and backend are required without an execution router")
+            target_config = config.execution.target(config.execution.default_target)
+            target = ExecutionTarget(
+                config=target_config,
+                workspace=workspace,
+                backend=backend,
+            )
+            execution = ExecutionRouter(
+                targets={target.id: target},
+                default_target=target.id,
+                label_prefix=config.execution.label_prefix,
+            )
+        self.execution = execution
         self.state = state
         self.events = events
         self.prompts = prompts
@@ -81,30 +98,24 @@ class Orchestrator:
         states = self.state.load_all()
         await self.events.emit("cold_start.begin", details={"durable_issue_count": len(states)})
         for local in states:
-            if local.process is not None:
-                matched = self.process_guard.matches(local.process)
-                terminated = False
-                if matched:
-                    terminated = await self.process_guard.terminate_tree(
-                        local.process, grace_seconds=self.config.agent.cancel_grace_seconds
-                    )
-                await self.events.emit(
-                    "cold_start.orphan_reaped",
-                    issue_id=local.issue_id,
-                    identifier=local.identifier,
-                    attempt_id=local.process.attempt_id,
-                    details={
-                        "pid": local.process.pid,
-                        "identity_matched": matched,
-                        "terminated": terminated,
-                    },
-                )
-                local.process = None
+            needs_reap = local.process is not None or local.phase in {
+                LocalPhase.RUNNING,
+                LocalPhase.BLOCKED,
+            }
+            if needs_reap and local.last_outcome != "placement_blocked":
+                reap = await self._reap_state(local, event_prefix="cold_start")
+                if not reap:
+                    # Keep reconciling tracker metadata below, but never turn
+                    # an unconfirmed remote executor into dispatchable state.
+                    local.phase = LocalPhase.BLOCKED
+                else:
+                    local.phase = LocalPhase.READY
 
             try:
                 issue = await self.tracker.get_issue(local.issue_id)
             except TrackerError as error:
-                local.phase = LocalPhase.READY
+                if local.phase is not LocalPhase.BLOCKED:
+                    local.phase = LocalPhase.READY
                 local.next_run_at = None
                 local.last_error = f"cold-start tracker refresh failed: {error}"
                 local.recovery_count += 1
@@ -122,7 +133,14 @@ class Orchestrator:
             local.next_run_at = None
             if issue is not None:
                 self._refresh_local_snapshot(local, issue)
-            if disposition is IssueDisposition.ACTIVE:
+            if local.phase is LocalPhase.BLOCKED and local.last_outcome == "placement_blocked":
+                if disposition is not IssueDisposition.ACTIVE:
+                    local.phase = LocalPhase.RELEASED
+                    local.last_outcome = "cold_start_tracker_override"
+                    local.last_error = None
+            elif local.phase is LocalPhase.BLOCKED:
+                local.last_outcome = "executor_stop_unconfirmed"
+            elif disposition is IssueDisposition.ACTIVE:
                 local.phase = LocalPhase.READY
                 local.last_outcome = "cold_start_recovered"
                 local.last_error = None
@@ -143,6 +161,78 @@ class Orchestrator:
             )
         await self.events.emit("cold_start.complete", details={})
 
+    async def _reap_state(self, local: IssueState, *, event_prefix: str) -> bool:
+        target_id = self._state_target_id(local)
+        attempt_id = local.last_attempt_id or (
+            local.process.attempt_id if local.process is not None else None
+        )
+        if not attempt_id:
+            local.phase = LocalPhase.BLOCKED
+            local.last_error = "cannot prove executor stopped: durable attempt_id is absent"
+            self.state.save(local)
+            await self.events.emit(
+                f"{event_prefix}.orphan_reap_unconfirmed",
+                issue_id=local.issue_id,
+                identifier=local.identifier,
+                details={"execution_target": target_id, "error": local.last_error},
+            )
+            return False
+        try:
+            target = self.execution.target(target_id)
+        except PlacementError as error:
+            local.phase = LocalPhase.BLOCKED
+            local.last_error = str(error)
+            self.state.save(local)
+            await self.events.emit(
+                f"{event_prefix}.orphan_reap_unconfirmed",
+                issue_id=local.issue_id,
+                identifier=local.identifier,
+                attempt_id=attempt_id,
+                details={"execution_target": target_id, "error": str(error)},
+            )
+            return False
+        result = await target.reap(
+            attempt_id=attempt_id,
+            identity=local.process,
+            process_guard=self.process_guard,
+        )
+        event_type = (
+            f"{event_prefix}.orphan_reaped"
+            if result.confirmed_safe
+            else f"{event_prefix}.orphan_reap_unconfirmed"
+        )
+        await self.events.emit(
+            event_type,
+            issue_id=local.issue_id,
+            identifier=local.identifier,
+            attempt_id=attempt_id,
+            details={
+                "execution_target": target_id,
+                "pid": local.process.pid if local.process else None,
+                "identity_matched": result.identity_matched,
+                "terminated": result.terminated,
+                "confirmed_safe": result.confirmed_safe,
+                "error": result.error,
+            },
+        )
+        if result.confirmed_safe:
+            local.process = None
+            local.last_error = None
+            self.state.save(local)
+            return True
+        local.phase = LocalPhase.BLOCKED
+        local.next_run_at = None
+        local.last_error = f"remote executor stop is unconfirmed: {result.error or 'unknown'}"
+        self.state.save(local)
+        return False
+
+    def _state_target_id(self, local: IssueState) -> str:
+        if local.execution_target:
+            return local.execution_target
+        if local.process and local.process.host_id != "local":
+            return local.process.host_id
+        return self.execution.default_target
+
     async def tick(self) -> None:
         async with self._tick_lock:
             await self._reconcile_running()
@@ -155,6 +245,7 @@ class Orchestrator:
                 return
 
             active_by_id = {issue.id: issue for issue in candidates}
+            await self._reconcile_blocked(active_by_id)
             await self._reconcile_waiting(active_by_id)
             for issue in candidates:
                 local = self.state.for_issue(issue)
@@ -165,21 +256,52 @@ class Orchestrator:
                     self.state.save(local)
                     await self.events.emit("tracker.issue_reactivated", issue=issue, details={})
 
-            slots = self.config.max_concurrent_agents - len(self.running)
-            if slots <= 0:
+            global_slots = self.config.max_concurrent_agents - len(self.running)
+            if global_slots <= 0:
                 return
+            target_counts = Counter(entry.target_id for entry in self.running.values())
             now = utc_now()
             for issue in sorted(candidates, key=lambda item: (item.iid, item.id)):
-                if slots <= 0:
+                if global_slots <= 0:
                     break
                 if issue.id in self.running:
                     continue
                 local = self.state.for_issue(issue)
                 if local.phase is LocalPhase.RUNNING:
+                    safe = await self._reap_state(local, event_prefix="reconcile")
+                    if not safe:
+                        continue
                     local.phase = LocalPhase.READY
-                    local.process = None
+                    local.next_run_at = None
                     self.state.save(local)
                     await self.events.emit("state.stale_running_released", issue=issue, details={})
+                try:
+                    target_id = self.execution.placement(issue)
+                    target = self.execution.target(target_id)
+                except PlacementError as error:
+                    local.phase = LocalPhase.BLOCKED
+                    local.last_outcome = "placement_blocked"
+                    local.last_error = str(error)
+                    local.next_run_at = None
+                    self.state.save(local)
+                    await self.events.emit(
+                        "placement.blocked",
+                        issue=issue,
+                        details={"error": str(error)},
+                    )
+                    continue
+                if local.phase is LocalPhase.BLOCKED:
+                    if local.last_outcome != "placement_blocked":
+                        continue
+                    local.phase = LocalPhase.READY
+                    local.last_error = None
+                    local.last_outcome = "placement_unblocked"
+                    self.state.save(local)
+                    await self.events.emit(
+                        "placement.unblocked",
+                        issue=issue,
+                        details={"execution_target": target_id},
+                    )
                 if local.phase not in {
                     LocalPhase.READY,
                     LocalPhase.CONTINUATION_WAIT,
@@ -189,8 +311,28 @@ class Orchestrator:
                 due = _parse_time(local.next_run_at)
                 if due is not None and due > now:
                     continue
-                self._dispatch(issue)
-                slots -= 1
+                if target_counts[target_id] >= target.max_concurrent_agents:
+                    continue
+                if local.execution_target and local.execution_target != target_id:
+                    previous_target = local.execution_target
+                    local.backend_session_id = None
+                    local.workspace_path = None
+                    local.branch = None
+                    local.continuation_index = 0
+                    await self.events.emit(
+                        "placement.changed",
+                        issue=issue,
+                        details={
+                            "previous_target": previous_target,
+                            "execution_target": target_id,
+                            "native_session_cleared": True,
+                        },
+                    )
+                local.execution_target = target_id
+                self.state.save(local)
+                self._dispatch(issue, target_id)
+                target_counts[target_id] += 1
+                global_slots -= 1
 
     async def run_forever(self) -> None:
         await self.recover()
@@ -199,6 +341,13 @@ class Orchestrator:
             details={
                 "poll_interval_seconds": self.config.poll_interval_seconds,
                 "max_concurrent_agents": self.config.max_concurrent_agents,
+                "execution_targets": {
+                    target_id: {
+                        "kind": target.config.kind,
+                        "max_concurrent_agents": target.max_concurrent_agents,
+                    }
+                    for target_id, target in self.execution.targets.items()
+                },
             },
         )
         try:
@@ -225,7 +374,13 @@ class Orchestrator:
                 "scheduler.shutdown_cancel_requested", issue=entry.issue, details={}
             )
         if entries:
-            timeout = self.config.agent.cancel_grace_seconds + 5
+            timeout = (
+                max(
+                    self.execution.target(entry.target_id).config.agent.cancel_grace_seconds
+                    for entry in entries
+                )
+                + 15
+            )
             _done, pending = await asyncio.wait([entry.task for entry in entries], timeout=timeout)
             for task in pending:
                 task.cancel()
@@ -233,10 +388,15 @@ class Orchestrator:
                 await asyncio.gather(*pending, return_exceptions=True)
         await self.events.emit("scheduler.stopped", details={})
 
-    def _dispatch(self, issue: Issue) -> None:
+    def _dispatch(self, issue: Issue, target_id: str) -> None:
         cancel_event = asyncio.Event()
-        task = asyncio.create_task(self._execute(issue, cancel_event))
-        entry = RunningEntry(issue=issue, cancel_event=cancel_event, task=task)
+        task = asyncio.create_task(self._execute(issue, target_id, cancel_event))
+        entry = RunningEntry(
+            issue=issue,
+            target_id=target_id,
+            cancel_event=cancel_event,
+            task=task,
+        )
         self.running[issue.id] = entry
 
         def completed(done_task: asyncio.Task[None], issue_id: str = issue.id) -> None:
@@ -249,13 +409,15 @@ class Orchestrator:
 
         task.add_done_callback(completed)
 
-    async def _execute(self, issue: Issue, cancel_event: asyncio.Event) -> None:
+    async def _execute(self, issue: Issue, target_id: str, cancel_event: asyncio.Event) -> None:
+        target = self.execution.target(target_id)
         local = self.state.for_issue(issue)
         attempt_id = str(uuid.uuid4())
         attempt_number = local.total_attempts + 1
         local.phase = LocalPhase.RUNNING
         local.next_run_at = None
         local.last_attempt_id = attempt_id
+        local.execution_target = target_id
         local.process = None
         self.state.save(local)
         await self.events.emit(
@@ -266,11 +428,12 @@ class Orchestrator:
                 "attempt_number": attempt_number,
                 "failure_count": local.failure_count,
                 "continuation_index": local.continuation_index,
+                "execution_target": target_id,
             },
         )
 
         try:
-            workspace = await self.workspace.ensure(issue)
+            workspace = await target.workspace.ensure(issue, attempt_id=attempt_id)
             local.workspace_path = str(workspace.path)
             local.branch = workspace.branch
             self.state.save(local)
@@ -282,15 +445,16 @@ class Orchestrator:
                     "path": str(workspace.path),
                     "branch": workspace.branch,
                     "created_now": workspace.created_now,
+                    "execution_target": target_id,
                 },
             )
-            mode = self._continuation_mode(local)
+            mode = self._continuation_mode(local, target)
             if mode is ContinuationMode.FIRST:
                 prompt = self.prompts.first(issue)
             elif mode is ContinuationMode.NATIVE:
                 prompt = self.prompts.native_continuation(issue, turn=local.continuation_index + 1)
             else:
-                snapshot = await self.workspace.snapshot(workspace.path)
+                snapshot = await target.workspace.snapshot(workspace.path)
                 prompt = self.prompts.stateless_continuation(
                     issue,
                     previous_summary=local.last_summary,
@@ -323,7 +487,11 @@ class Orchestrator:
                 self.state.save(local)
                 await emit(
                     "attempt.process_started",
-                    {"pid": identity.pid, "create_time": identity.create_time},
+                    {
+                        "pid": identity.pid,
+                        "create_time": identity.create_time,
+                        "execution_target": identity.host_id,
+                    },
                 )
 
             if cancel_event.is_set():
@@ -335,7 +503,7 @@ class Orchestrator:
                     error="cancelled before executor launch",
                 )
             else:
-                result = await self.backend.run(
+                result = await target.backend.run(
                     context,
                     cancel_event=cancel_event,
                     callbacks=BackendCallbacks(emit=emit, process_started=process_started),
@@ -343,24 +511,48 @@ class Orchestrator:
             await self._finish_attempt(
                 issue=issue,
                 local=local,
+                target=target,
                 result=result,
                 mode=mode,
                 attempt_id=attempt_id,
                 attempt_number=attempt_number,
             )
         except asyncio.CancelledError:
-            local.process = None
-            local.phase = LocalPhase.READY
-            local.next_run_at = iso_now()
+            reap = await target.reap(
+                attempt_id=attempt_id,
+                identity=local.process,
+                process_guard=self.process_guard,
+            )
+            if reap.confirmed_safe:
+                local.process = None
+                local.phase = LocalPhase.READY
+                local.next_run_at = iso_now()
+            else:
+                local.phase = LocalPhase.BLOCKED
+                local.next_run_at = None
             local.last_outcome = AttemptOutcome.CANCELLED.value
-            local.last_error = "scheduler task cancelled"
+            local.last_error = (
+                "scheduler task cancelled"
+                if reap.confirmed_safe
+                else f"scheduler task cancelled; remote stop unconfirmed: {reap.error}"
+            )
             self.state.save(local)
             await self.events.emit(
-                "attempt.task_cancelled", issue=issue, attempt_id=attempt_id, details={}
+                "attempt.task_cancelled",
+                issue=issue,
+                attempt_id=attempt_id,
+                details={
+                    "execution_target": target_id,
+                    "executor_safe": reap.confirmed_safe,
+                },
             )
             raise
         except Exception as error:  # noqa: BLE001 - one failed issue must not kill the scheduler
-            local.process = None
+            reap = await target.reap(
+                attempt_id=attempt_id,
+                identity=local.process,
+                process_guard=self.process_guard,
+            )
             local.total_attempts = attempt_number
             await self.events.emit(
                 "attempt.internal_error",
@@ -368,6 +560,17 @@ class Orchestrator:
                 attempt_id=attempt_id,
                 details={"error": f"{type(error).__name__}: {error}"},
             )
+            if not reap.confirmed_safe:
+                local.phase = LocalPhase.BLOCKED
+                local.next_run_at = None
+                local.last_outcome = "executor_stop_unconfirmed"
+                local.last_error = (
+                    f"scheduler attempt error and executor stop unconfirmed: "
+                    f"{type(error).__name__}: {error}; {reap.error or 'unknown'}"
+                )
+                self.state.save(local)
+                return
+            local.process = None
             await self._schedule_failure(
                 issue,
                 local,
@@ -381,18 +584,42 @@ class Orchestrator:
         *,
         issue: Issue,
         local: IssueState,
+        target: ExecutionTarget,
         result: AgentResult,
         mode: ContinuationMode,
         attempt_id: str,
         attempt_number: int,
     ) -> None:
-        local.process = None
         local.total_attempts = attempt_number
         local.last_outcome = result.outcome.value
         local.last_error = result.error
         local.last_summary = result.summary
         if result.session_id:
             local.backend_session_id = result.session_id
+        if not result.executor_safe:
+            local.phase = LocalPhase.BLOCKED
+            local.next_run_at = None
+            local.last_outcome = "executor_stop_unconfirmed"
+            local.last_error = result.error or "execution target could not confirm executor stop"
+            try:
+                refreshed = await self.tracker.get_issue(issue.id)
+                if refreshed is not None:
+                    self._refresh_local_snapshot(local, refreshed)
+            except TrackerError:
+                pass
+            self.state.save(local)
+            await self.events.emit(
+                "attempt.executor_stop_unconfirmed",
+                issue=issue,
+                attempt_id=attempt_id,
+                details={
+                    "execution_target": target.id,
+                    "outcome": result.outcome.value,
+                    "error": result.error,
+                },
+            )
+            return
+        local.process = None
         self.state.save(local)
 
         try:
@@ -439,7 +666,12 @@ class Orchestrator:
         entry = self.running.get(issue.id)
         cancel_reason = entry.cancel_reason if entry else None
         if result.outcome is AttemptOutcome.CLEAN_EXIT:
-            await self._schedule_clean_continuation(current_issue, local, attempt_id=attempt_id)
+            await self._schedule_clean_continuation(
+                current_issue,
+                local,
+                target=target,
+                attempt_id=attempt_id,
+            )
         elif result.outcome is AttemptOutcome.CANCELLED and cancel_reason == "scheduler_shutdown":
             local.phase = LocalPhase.READY
             local.next_run_at = iso_now()
@@ -479,7 +711,12 @@ class Orchestrator:
             )
 
     async def _schedule_clean_continuation(
-        self, issue: Issue, local: IssueState, *, attempt_id: str
+        self,
+        issue: Issue,
+        local: IssueState,
+        *,
+        target: ExecutionTarget,
+        attempt_id: str,
     ) -> None:
         local.failure_count = 0
         local.continuation_index += 1
@@ -503,7 +740,7 @@ class Orchestrator:
                 "yielded_at_cap": yielded,
                 "next_path": (
                     ContinuationMode.NATIVE.value
-                    if local.backend_session_id and self.backend.supports_native_resume
+                    if local.backend_session_id and target.backend.supports_native_resume
                     else ContinuationMode.STATELESS.value
                 ),
             },
@@ -558,8 +795,28 @@ class Orchestrator:
             disposition = self.tracker.disposition(result)
             if disposition is IssueDisposition.ACTIVE and result is not None:
                 entry.issue = result
-                continue
-            entry.cancel_reason = f"tracker_{disposition.value}"
+                try:
+                    requested_target = self.execution.placement(result)
+                except PlacementError as error:
+                    entry.cancel_reason = "placement_invalid"
+                    cancel_details = {
+                        "disposition": disposition.value,
+                        "reason": "placement_invalid",
+                        "error": str(error),
+                    }
+                else:
+                    if requested_target == entry.target_id:
+                        continue
+                    entry.cancel_reason = "execution_target_changed"
+                    cancel_details = {
+                        "disposition": disposition.value,
+                        "reason": "execution_target_changed",
+                        "previous_target": entry.target_id,
+                        "requested_target": requested_target,
+                    }
+            else:
+                entry.cancel_reason = f"tracker_{disposition.value}"
+                cancel_details = {"disposition": disposition.value}
             entry.cancel_event.set()
             to_cancel.append(entry)
             await self.events.emit(
@@ -567,11 +824,17 @@ class Orchestrator:
                 issue=result,
                 issue_id=entry.issue.id,
                 identifier=entry.issue.identifier,
-                details={"disposition": disposition.value},
+                details=cancel_details,
             )
 
         if to_cancel:
-            timeout = self.config.agent.cancel_grace_seconds + 5
+            timeout = (
+                max(
+                    self.execution.target(entry.target_id).config.agent.cancel_grace_seconds
+                    for entry in to_cancel
+                )
+                + 15
+            )
             _done, pending = await asyncio.wait(
                 [entry.task for entry in to_cancel], timeout=timeout
             )
@@ -582,7 +845,10 @@ class Orchestrator:
 
     async def _reconcile_waiting(self, active_by_id: dict[str, Issue]) -> None:
         for local in self.state.load_all():
-            if local.issue_id in self.running or local.phase is LocalPhase.RELEASED:
+            if local.issue_id in self.running or local.phase in {
+                LocalPhase.RELEASED,
+                LocalPhase.BLOCKED,
+            }:
                 continue
             active = active_by_id.get(local.issue_id)
             if active is not None:
@@ -616,10 +882,73 @@ class Orchestrator:
                 details={"disposition": disposition.value},
             )
 
-    def _continuation_mode(self, local: IssueState) -> ContinuationMode:
+    async def _reconcile_blocked(self, active_by_id: dict[str, Issue]) -> None:
+        for local in self.state.load_all():
+            if local.phase is not LocalPhase.BLOCKED:
+                continue
+            if local.last_outcome == "placement_blocked":
+                issue = active_by_id.get(local.issue_id)
+                if issue is None:
+                    try:
+                        issue = await self.tracker.get_issue(local.issue_id)
+                    except TrackerError:
+                        continue
+                disposition = self.tracker.disposition(issue)
+                if disposition is not IssueDisposition.ACTIVE:
+                    if issue is not None:
+                        self._refresh_local_snapshot(local, issue)
+                    local.phase = LocalPhase.RELEASED
+                    local.next_run_at = None
+                    local.last_outcome = "placement_block_released_by_tracker"
+                    local.last_error = None
+                    self.state.save(local)
+                    await self.events.emit(
+                        "placement.block_released_by_tracker",
+                        issue=issue,
+                        issue_id=local.issue_id,
+                        identifier=local.identifier,
+                        details={"disposition": disposition.value},
+                    )
+                continue
+            safe = await self._reap_state(local, event_prefix="reconcile")
+            if not safe:
+                continue
+            issue = active_by_id.get(local.issue_id)
+            if issue is None:
+                try:
+                    issue = await self.tracker.get_issue(local.issue_id)
+                except TrackerError as error:
+                    local.phase = LocalPhase.READY
+                    local.last_error = f"executor is safe; tracker refresh failed: {error}"
+                    self.state.save(local)
+                    continue
+            disposition = self.tracker.disposition(issue)
+            if issue is not None:
+                self._refresh_local_snapshot(local, issue)
+            local.phase = (
+                LocalPhase.READY if disposition is IssueDisposition.ACTIVE else LocalPhase.RELEASED
+            )
+            local.next_run_at = None
+            local.last_outcome = "executor_stop_confirmed"
+            local.last_error = None
+            self.state.save(local)
+            await self.events.emit(
+                "reconcile.executor_unblocked",
+                issue=issue,
+                issue_id=local.issue_id,
+                identifier=local.identifier,
+                details={
+                    "execution_target": self._state_target_id(local),
+                    "disposition": disposition.value,
+                    "local_phase": local.phase.value,
+                },
+            )
+
+    @staticmethod
+    def _continuation_mode(local: IssueState, target: ExecutionTarget) -> ContinuationMode:
         if local.total_attempts == 0:
             return ContinuationMode.FIRST
-        if local.backend_session_id and self.backend.supports_native_resume:
+        if local.backend_session_id and target.backend.supports_native_resume:
             return ContinuationMode.NATIVE
         return ContinuationMode.STATELESS
 

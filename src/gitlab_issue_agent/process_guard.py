@@ -13,9 +13,14 @@ class ProcessGuard:
     """Captures process birth identity and terminates only the matching process tree."""
 
     @staticmethod
-    def capture(pid: int, attempt_id: str) -> ProcessIdentity:
+    def capture(pid: int, attempt_id: str, *, host_id: str = "local") -> ProcessIdentity:
         process = psutil.Process(pid)
-        return ProcessIdentity(pid=pid, create_time=process.create_time(), attempt_id=attempt_id)
+        return ProcessIdentity(
+            pid=pid,
+            create_time=process.create_time(),
+            attempt_id=attempt_id,
+            host_id=host_id,
+        )
 
     @staticmethod
     def matches(identity: ProcessIdentity) -> bool:

@@ -20,6 +20,27 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e ".[test]"
+      - name: Start loopback OpenSSH execution host
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y openssh-server
+          mkdir -p "$RUNNER_TEMP/issue-agent-ssh" "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/issue-agent-ssh/id_ed25519"
+          cat "$RUNNER_TEMP/issue-agent-ssh/id_ed25519.pub" >> "$HOME/.ssh/authorized_keys"
+          chmod 600 "$HOME/.ssh/authorized_keys"
+          sudo ssh-keygen -A
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -p 22222
+          ssh-keyscan -p 22222 127.0.0.1 > "$RUNNER_TEMP/issue-agent-ssh/known_hosts"
+          echo "ISSUE_AGENT_TEST_SSH=1" >> "$GITHUB_ENV"
+          echo "ISSUE_AGENT_TEST_SSH_HOST=127.0.0.1" >> "$GITHUB_ENV"
+          echo "ISSUE_AGENT_TEST_SSH_PORT=22222" >> "$GITHUB_ENV"
+          echo "ISSUE_AGENT_TEST_SSH_USER=$(id -un)" >> "$GITHUB_ENV"
+          echo "ISSUE_AGENT_TEST_SSH_IDENTITY=$RUNNER_TEMP/issue-agent-ssh/id_ed25519" >> "$GITHUB_ENV"
+          echo "ISSUE_AGENT_TEST_SSH_KNOWN_HOSTS=$RUNNER_TEMP/issue-agent-ssh/known_hosts" >> "$GITHUB_ENV"
       - run: ruff check src tests
       - run: python -m compileall -q src tests
       - run: python -m pytest -q
