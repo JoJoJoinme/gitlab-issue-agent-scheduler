@@ -1,0 +1,53 @@
+workflow_file: ./WORKFLOW.md
+
+scheduler:
+  state_root: ./.scheduler
+  poll_interval_seconds: 5
+  max_concurrent_agents: 4
+
+tracker:
+  base_url: https://gitlab.internal.example
+  token: $GITLAB_TOKEN
+  project: platform/example-service
+  active_states: [opened]
+  terminal_states: [closed]
+  required_labels: []
+  active_labels: ["agent::ready"]
+  terminal_labels: ["agent::done", "agent::cancelled"]
+  request_timeout_seconds: 20
+
+repository:
+  # Prefer SSH or a credential helper. Do not embed tokens in this URL.
+  clone_url: git@gitlab.internal.example:platform/example-service.git
+  default_branch: main
+  branch_prefix: agent/issue-
+  fetch_on_create: true
+
+agent:
+  # Set this to csc if that is the installed internal command.
+  command: custom-claude
+  args: ["-p", "{prompt}", "--output-format", "stream-json"]
+  native_resume_args:
+    ["--resume", "{session_id}", "-p", "{prompt}", "--output-format", "stream-json"]
+  prefer_native_resume: true
+  output_format: auto
+  session_id_paths: ["session_id", "session.id"]
+  timeout_seconds: 7200
+  cancel_grace_seconds: 10
+  summary_chars: 8000
+  # Tracker credentials are not inherited. Add only variables the agent truly needs.
+  pass_env: [HTTPS_PROXY, HTTP_PROXY, NO_PROXY]
+  env: {}
+
+continuation:
+  delay_seconds: 1
+  max_consecutive: 20
+  yield_seconds: 30
+
+retry:
+  initial_seconds: 10
+  max_seconds: 300
+  multiplier: 2
+
+observability:
+  stdout_json: true

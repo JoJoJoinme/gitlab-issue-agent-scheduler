@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gitlab-issue-agent-scheduler"
+version = "0.1.0"
+description = "A GitLab Issue-driven scheduler for long-running coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "JoJoJoinme" }]
+dependencies = [
+  "filelock>=3.15,<4",
+  "httpx>=0.27,<1",
+  "psutil>=6,<8",
+  "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8.2,<9",
+  "pytest-asyncio>=0.23,<1",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+gitlab-agent-scheduler = "gitlab_issue_agent.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gitlab_issue_agent"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
