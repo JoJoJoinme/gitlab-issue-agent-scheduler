@@ -121,7 +121,7 @@ pip install -e '.[test]'
 pytest -q
 ```
 
-The crash-recovery test writes the same durable `RUNNING + process identity` boundary left by an abrupt scheduler death, launches a real orphan process, and verifies that cold-start reconciliation kills it before applying current tracker state.
+The cross-platform crash-recovery test writes the durable `RUNNING + process identity` boundary left by an abrupt scheduler death, launches a real orphan process, and verifies that cold-start reconciliation kills it before applying current tracker state. A separate POSIX end-to-end test starts the real CLI scheduler and fake GitLab, sends the scheduler `SIGKILL`, proves the executor survived, changes the issue to human review, then starts a replacement scheduler and verifies orphan cleanup plus tracker override.
 
 ## Design documents
 
