@@ -11,6 +11,9 @@ class PromptError(RuntimeError):
 
 
 class PromptBuilder:
+    _CHECKPOINT_MARKER = "## Continuation checkpoint"
+    _MAX_CHECKPOINT_CHARS = 2500
+
     def __init__(self, workflow_file: Path) -> None:
         self.workflow_file = workflow_file
 
@@ -26,6 +29,10 @@ class PromptBuilder:
 - Inspect current files and tests, then continue the remaining work without restarting completed work.
 - Do not merge. Stop only after moving the issue to the configured human-review/non-active gate, a terminal state, or when genuinely blocked.
 
+## Persistent goal and handoff contract
+
+{self._goal_contract()}
+
 Refreshed tracker snapshot:
 {self._issue_json(issue)}
 """
@@ -38,23 +45,47 @@ Refreshed tracker snapshot:
         workspace_snapshot: str,
         attempt_number: int,
     ) -> str:
+        checkpoint = self.extract_continuation_checkpoint(previous_summary)
+        if checkpoint:
+            prior_context = f"""Recovered structured continuation checkpoint:
+```text
+{checkpoint}
+```"""
+        else:
+            prior_context = f"""No structured continuation checkpoint was recovered. Fall back to the previous bounded backend tail:
+```text
+{previous_summary or "(no usable prior output)"}
+```"""
         context = f"""The backend session cannot be resumed natively. Reconstruct state from durable evidence.
 
 Attempt number: {attempt_number}
 
-Previous bounded agent summary:
-```text
-{previous_summary or "(no usable prior summary)"}
-```
+{prior_context}
 
 Current git worktree evidence:
 ```text
 {workspace_snapshot}
 ```
 
-Do not assume the summary is complete. Inspect the worktree, git history, tests, and the current issue before acting.
+Treat generated handoff text as a fallible working note, not an authoritative record. It can be incomplete or stale. Re-check the current issue, worktree, git history, and tests before acting; concrete repository evidence overrides the note.
 """
         return self._full(issue, continuation_context=context)
+
+    @classmethod
+    def extract_continuation_checkpoint(cls, previous_summary: str) -> str:
+        """Recover only the latest structured handoff from a bounded backend tail.
+
+        The backend intentionally stays model-neutral and stores a bounded tail. This
+        parser gives stateless reconstruction a deterministic semantic boundary without
+        trusting or persisting arbitrary generated prose as scheduler authority.
+        """
+        marker_index = previous_summary.rfind(cls._CHECKPOINT_MARKER)
+        if marker_index < 0:
+            return ""
+        checkpoint = previous_summary[marker_index:].strip()
+        if len(checkpoint) > cls._MAX_CHECKPOINT_CHARS:
+            checkpoint = checkpoint[: cls._MAX_CHECKPOINT_CHARS].rstrip()
+        return checkpoint
 
     def _full(self, issue: Issue, *, continuation_context: str | None) -> str:
         workflow = self._workflow_body()
@@ -80,6 +111,10 @@ The GitLab Issue snapshot below is the authoritative objective. Local scheduler 
 
 {workflow}
 
+## Persistent goal and handoff contract
+
+{self._goal_contract()}
+
 ## Authoritative GitLab Issue snapshot
 
 ```json
@@ -87,6 +122,31 @@ The GitLab Issue snapshot below is the authoritative objective. Local scheduler 
 ```
 {continuation}
 """
+
+    @staticmethod
+    def _goal_contract() -> str:
+        return """Treat the Issue as one persistent goal across process turns, not as a sequence of unrelated prompts.
+
+Before acting, keep these four items explicit from the Issue and repository evidence:
+
+1. desired outcome;
+2. constraints and non-goals;
+3. verification evidence that can prove progress or completion;
+4. the stop condition for handing work to human review or declaring a genuine blocker.
+
+Do not invent unsupported acceptance criteria. If the Issue is ambiguous in a way that can materially change the result, preserve the ambiguity in the handoff rather than silently choosing a new objective.
+
+If this process turn exits cleanly while the Issue is still active, end the final output with the following concise checkpoint. Keep it under 2,000 characters and do not include secrets:
+
+## Continuation checkpoint
+- Goal status: <what is complete vs. incomplete>
+- Decisions and constraints: <important choices that a fresh agent must preserve>
+- Verification evidence: <tests, measurements, or concrete observations already obtained>
+- Failed approaches / risks: <what was tried or remains risky>
+- Remaining work: <specific unfinished items>
+- Next action: <the highest-value next step>
+
+The checkpoint is working memory only. It never overrides the GitLab Issue, repository state, tests, or the configured human-review gate."""
 
     def _workflow_body(self) -> str:
         try:
