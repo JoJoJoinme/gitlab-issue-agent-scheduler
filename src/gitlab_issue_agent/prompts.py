@@ -26,6 +26,10 @@ class PromptBuilder:
 - Inspect current files and tests, then continue the remaining work without restarting completed work.
 - Do not merge. Stop only after moving the issue to the configured human-review/non-active gate, a terminal state, or when genuinely blocked.
 
+## Persistent goal and handoff contract
+
+{self._goal_contract()}
+
 Refreshed tracker snapshot:
 {self._issue_json(issue)}
 """
@@ -42,9 +46,9 @@ Refreshed tracker snapshot:
 
 Attempt number: {attempt_number}
 
-Previous bounded agent summary:
+Latest bounded backend tail (expected to end with a Continuation checkpoint when the prior agent followed the handoff contract):
 ```text
-{previous_summary or "(no usable prior summary)"}
+{previous_summary or "(no usable prior summary or checkpoint)"}
 ```
 
 Current git worktree evidence:
@@ -52,7 +56,7 @@ Current git worktree evidence:
 {workspace_snapshot}
 ```
 
-Do not assume the summary is complete. Inspect the worktree, git history, tests, and the current issue before acting.
+Treat the backend tail as a fallible working note, not an authoritative record. It can be incomplete or stale. Re-check the current issue, worktree, git history, and tests before acting; concrete repository evidence overrides the note.
 """
         return self._full(issue, continuation_context=context)
 
@@ -80,6 +84,10 @@ The GitLab Issue snapshot below is the authoritative objective. Local scheduler 
 
 {workflow}
 
+## Persistent goal and handoff contract
+
+{self._goal_contract()}
+
 ## Authoritative GitLab Issue snapshot
 
 ```json
@@ -87,6 +95,31 @@ The GitLab Issue snapshot below is the authoritative objective. Local scheduler 
 ```
 {continuation}
 """
+
+    @staticmethod
+    def _goal_contract() -> str:
+        return """Treat the Issue as one persistent goal across process turns, not as a sequence of unrelated prompts.
+
+Before acting, keep these four items explicit from the Issue and repository evidence:
+
+1. desired outcome;
+2. constraints and non-goals;
+3. verification evidence that can prove progress or completion;
+4. the stop condition for handing work to human review or declaring a genuine blocker.
+
+Do not invent unsupported acceptance criteria. If the Issue is ambiguous in a way that can materially change the result, preserve the ambiguity in the handoff rather than silently choosing a new objective.
+
+If this process turn exits cleanly while the Issue is still active, end the final output with the following concise checkpoint. Keep it under 2,000 characters and do not include secrets:
+
+## Continuation checkpoint
+- Goal status: <what is complete vs. incomplete>
+- Decisions and constraints: <important choices that a fresh agent must preserve>
+- Verification evidence: <tests, measurements, or concrete observations already obtained>
+- Failed approaches / risks: <what was tried or remains risky>
+- Remaining work: <specific unfinished items>
+- Next action: <the highest-value next step>
+
+The checkpoint is working memory only. It never overrides the GitLab Issue, repository state, tests, or the configured human-review gate."""
 
     def _workflow_body(self) -> str:
         try:
