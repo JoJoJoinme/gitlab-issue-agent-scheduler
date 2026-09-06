@@ -41,15 +41,51 @@ def test_native_continuation_repeats_handoff_contract(tmp_path: Path) -> None:
     assert "## Continuation checkpoint" in prompt
 
 
-def test_stateless_continuation_treats_tail_as_fallible_evidence(tmp_path: Path) -> None:
+def test_stateless_continuation_recovers_structured_checkpoint(tmp_path: Path) -> None:
+    prior = """noisy older output
+another line
+## Continuation checkpoint
+- Goal status: half done
+- Next action: run integration tests
+"""
     prompt = _builder(tmp_path).stateless_continuation(
         _issue(),
-        previous_summary="## Continuation checkpoint\n- Goal status: half done",
+        previous_summary=prior,
         workspace_snapshot="[status]\n M src/worker.py",
         attempt_number=4,
     )
 
-    assert "Latest bounded backend tail" in prompt
-    assert "fallible working note, not an authoritative record" in prompt
-    assert "half done" in prompt
+    assert "Recovered structured continuation checkpoint" in prompt
+    assert "Goal status: half done" in prompt
+    assert "run integration tests" in prompt
+    assert "noisy older output" not in prompt
     assert "M src/worker.py" in prompt
+    assert "fallible working note, not an authoritative record" in prompt
+
+
+def test_stateless_continuation_falls_back_when_checkpoint_missing(tmp_path: Path) -> None:
+    prompt = _builder(tmp_path).stateless_continuation(
+        _issue(),
+        previous_summary="last useful observation",
+        workspace_snapshot="[status]\n(clean)",
+        attempt_number=2,
+    )
+
+    assert "No structured continuation checkpoint was recovered" in prompt
+    assert "last useful observation" in prompt
+
+
+def test_checkpoint_extractor_uses_latest_checkpoint_and_bounds_size(tmp_path: Path) -> None:
+    builder = _builder(tmp_path)
+    previous = (
+        "## Continuation checkpoint\n- Goal status: stale\n"
+        "noise\n"
+        "## Continuation checkpoint\n- Goal status: current\n"
+        + ("x" * 4000)
+    )
+
+    checkpoint = builder.extract_continuation_checkpoint(previous)
+
+    assert checkpoint.startswith("## Continuation checkpoint\n- Goal status: current")
+    assert "stale" not in checkpoint
+    assert len(checkpoint) <= builder._MAX_CHECKPOINT_CHARS
