@@ -13,14 +13,16 @@ The current P0 implementation had the control-plane half of that design, but sta
 
 ## P0.1 adaptation
 
-This repository now adds a backend-neutral prompt contract:
+This repository now adds a backend-neutral goal and handoff contract:
 
 1. Every turn treats the GitLab Issue as one persistent goal, not a fresh prompt.
 2. Before acting, the agent keeps four items explicit: desired outcome, constraints/non-goals, verification evidence, and stop condition.
 3. If a clean process turn ends while the Issue is still active, the agent ends its output with a concise `## Continuation checkpoint` containing goal status, decisions/constraints, verification evidence, failed approaches/risks, remaining work, and the next action.
-4. Stateless reconstruction treats the saved bounded backend tail as fallible working memory and re-validates it against the current Issue, worktree, git history, and tests.
+4. The stateless-reconstruction boundary deterministically extracts the **latest** structured checkpoint from the bounded backend tail. Older/noisy output is not replayed when a checkpoint is present.
+5. If no checkpoint exists, reconstruction falls back to the old bounded-tail behavior for backward compatibility.
+6. In both paths the generated handoff is explicitly treated as fallible working memory and re-validated against the current Issue, worktree, git history, and tests.
 
-This is deliberately small. The existing command backend already persists the tail of agent output in `IssueState.last_summary`, so putting the checkpoint at the end of the final output makes the existing durable state materially more useful without adding a model-specific memory service or changing the remote protocol.
+This is deliberately small. The existing command backend already persists a bounded tail of agent output in `IssueState.last_summary`; the checkpoint marker adds a semantic boundary on top of that durable state without adding a model-specific memory service or changing the remote protocol. The extracted checkpoint is bounded again before prompt injection.
 
 ## Authority and safety boundary
 
