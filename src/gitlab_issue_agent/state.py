@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .models import Issue, IssueState
+from .models import Issue, IssueState, LocalPhase
 
 
 def utc_now() -> datetime:
@@ -94,9 +94,69 @@ class StateStore:
     def _read(self, path: Path) -> IssueState:
         try:
             payload: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-            return IssueState.from_dict(payload)
+            state = IssueState.from_dict(payload)
+            self._recover_interrupted_attempt_metadata(state, path.parent)
+            return state
         except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
             raise RuntimeError(f"cannot load durable state {path}: {error}") from error
+
+    @staticmethod
+    def _recover_interrupted_attempt_metadata(state: IssueState, issue_dir: Path) -> None:
+        """Replay small, durable attempt facts that may be newer than state.json.
+
+        State snapshots are written before an executor starts, while attempt events are
+        appended as execution progresses. A hard scheduler crash can therefore leave a
+        RUNNING/BLOCKED snapshot without the attempt number or native session ID that was
+        already observed. Only interrupted execution states are repaired here; completed
+        READY/WAIT/RELEASED snapshots remain authoritative so old events cannot resurrect
+        a deliberately cleared session.
+        """
+        if state.phase not in {LocalPhase.RUNNING, LocalPhase.BLOCKED}:
+            return
+        if state.phase is LocalPhase.BLOCKED and state.last_outcome == "placement_blocked":
+            return
+        attempt_id = state.last_attempt_id
+        if not attempt_id:
+            return
+        events_path = issue_dir / "attempts" / attempt_id / "events.jsonl"
+        if not events_path.exists():
+            return
+
+        try:
+            lines = events_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                # A crash can leave an incomplete final line. Earlier flushed events
+                # remain useful recovery evidence.
+                continue
+            if not isinstance(event, dict) or event.get("attempt_id") != attempt_id:
+                continue
+            details = event.get("details")
+            if not isinstance(details, dict):
+                continue
+
+            attempt_number = details.get("attempt_number")
+            if (
+                isinstance(attempt_number, int)
+                and not isinstance(attempt_number, bool)
+                and attempt_number > state.total_attempts
+            ):
+                state.total_attempts = attempt_number
+
+            event_type = event.get("event_type")
+            if event_type in {"agent.session_observed", "agent.exited"}:
+                session_id = details.get("session_id")
+                if isinstance(session_id, str) and session_id.strip():
+                    state.backend_session_id = session_id.strip()
+            elif event_type == "continuation.native_resume_abandoned":
+                # A failed native continuation intentionally invalidates the session.
+                # Replaying an earlier session-observed event must not revive it.
+                state.backend_session_id = None
 
 
 def copy_state(state: IssueState, **changes: Any) -> IssueState:
