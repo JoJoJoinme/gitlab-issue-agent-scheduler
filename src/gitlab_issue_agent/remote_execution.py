@@ -4,7 +4,7 @@ import asyncio
 import time
 from typing import Any
 
-from .backend import AgentBackend, BackendCallbacks
+from .backend import AgentBackend, BackendCallbacks, agent_resume_fingerprint
 from .config import AgentConfig, RepositoryConfig
 from .models import (
     AgentResult,
@@ -90,6 +90,10 @@ class SSHAgentBackend(AgentBackend):
     @property
     def supports_native_resume(self) -> bool:
         return self.agent.supports_native_resume
+
+    @property
+    def native_resume_fingerprint(self) -> str | None:
+        return agent_resume_fingerprint(self.agent)
 
     def _base(self, operation: str) -> dict[str, Any]:
         return {

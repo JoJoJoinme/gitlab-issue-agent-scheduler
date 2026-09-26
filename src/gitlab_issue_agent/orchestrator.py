@@ -316,6 +316,7 @@ class Orchestrator:
                 if local.execution_target and local.execution_target != target_id:
                     previous_target = local.execution_target
                     local.backend_session_id = None
+                    local.backend_resume_fingerprint = None
                     local.workspace_path = None
                     local.branch = None
                     local.continuation_index = 0
@@ -447,6 +448,12 @@ class Orchestrator:
                     "created_now": workspace.created_now,
                     "execution_target": target_id,
                 },
+            )
+            await self._invalidate_incompatible_native_session(
+                issue,
+                local,
+                target=target,
+                attempt_id=attempt_id,
             )
             mode = self._continuation_mode(local, target)
             if mode is ContinuationMode.FIRST:
@@ -596,6 +603,7 @@ class Orchestrator:
         local.last_summary = result.summary
         if result.session_id:
             local.backend_session_id = result.session_id
+            local.backend_resume_fingerprint = target.backend.native_resume_fingerprint
         if not result.executor_safe:
             local.phase = LocalPhase.BLOCKED
             local.next_run_at = None
@@ -696,6 +704,7 @@ class Orchestrator:
         else:
             if mode is ContinuationMode.NATIVE:
                 local.backend_session_id = None
+                local.backend_resume_fingerprint = None
                 await self.events.emit(
                     "continuation.native_resume_abandoned",
                     issue=current_issue,
@@ -943,6 +952,44 @@ class Orchestrator:
                     "local_phase": local.phase.value,
                 },
             )
+
+    async def _invalidate_incompatible_native_session(
+        self,
+        issue: Issue,
+        local: IssueState,
+        *,
+        target: ExecutionTarget,
+        attempt_id: str,
+    ) -> None:
+        if not local.backend_session_id:
+            return
+        current = target.backend.native_resume_fingerprint
+        if current is None:
+            return
+        recorded = local.backend_resume_fingerprint
+        if recorded == current:
+            return
+
+        reason = (
+            "resume_contract_unrecorded"
+            if recorded is None
+            else "backend_contract_changed"
+        )
+        local.backend_session_id = None
+        local.backend_resume_fingerprint = None
+        self.state.save(local)
+        await self.events.emit(
+            "continuation.native_resume_invalidated",
+            issue=issue,
+            attempt_id=attempt_id,
+            details={
+                "reason": reason,
+                "execution_target": target.id,
+                "previous_fingerprint": recorded,
+                "current_fingerprint": current,
+                "next_mode": ContinuationMode.STATELESS.value,
+            },
+        )
 
     @staticmethod
     def _continuation_mode(local: IssueState, target: ExecutionTarget) -> ContinuationMode:

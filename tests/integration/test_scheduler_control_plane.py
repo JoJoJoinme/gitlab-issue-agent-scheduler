@@ -55,6 +55,7 @@ async def test_clean_exit_continues_natively_without_entering_failure_backoff(
             AgentResult(AttemptOutcome.CLEAN_EXIT, 0, "session-1", "second turn"),
         ],
         on_run=handoff_after_second_run,
+        resume_fingerprint="contract-v1",
     )
     config = make_config(tmp_path, origin_repo, continuation_delay=0.01)
     orchestrator = build_orchestrator(config, tracker, backend)
@@ -66,6 +67,7 @@ async def test_clean_exit_continues_natively_without_entering_failure_backoff(
     assert first_state is not None
     assert first_state.phase is LocalPhase.CONTINUATION_WAIT
     assert first_state.failure_count == 0
+    assert first_state.backend_resume_fingerprint == "contract-v1"
 
     await asyncio.sleep(0.02)
     await orchestrator.tick()
@@ -91,6 +93,94 @@ async def test_clean_exit_continues_natively_without_entering_failure_backoff(
         (orchestrator.state.issue_dir(issue.identifier) / "attempts").glob("*/events.jsonl")
     )
     assert len(attempt_events) == 2
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_backend_contract_change_invalidates_native_resume(
+    tmp_path: Path, origin_repo: Path
+) -> None:
+    issue = make_issue()
+    tracker = FakeTracker(issue)
+
+    def handoff_after_second_run(_context, index: int) -> None:
+        if index == 1:
+            tracker.handoff(issue.id)
+
+    backend = ScriptedBackend(
+        [
+            AgentResult(AttemptOutcome.CLEAN_EXIT, 0, "session-1", "first turn"),
+            AgentResult(AttemptOutcome.CLEAN_EXIT, 0, "session-2", "second turn"),
+        ],
+        on_run=handoff_after_second_run,
+        resume_fingerprint="contract-v1",
+    )
+    config = make_config(tmp_path, origin_repo, continuation_delay=0.01)
+    orchestrator = build_orchestrator(config, tracker, backend)
+
+    await orchestrator.recover()
+    await orchestrator.tick()
+    await wait_until(lambda: len(backend.contexts) == 1 and not orchestrator.running)
+    first_state = orchestrator.state.get(issue.identifier)
+    assert first_state is not None
+    assert first_state.backend_session_id == "session-1"
+    assert first_state.backend_resume_fingerprint == "contract-v1"
+
+    backend.resume_fingerprint = "contract-v2"
+    await asyncio.sleep(0.02)
+    await orchestrator.tick()
+    await wait_until(lambda: len(backend.contexts) == 2 and not orchestrator.running)
+
+    assert backend.contexts[1].mode is ContinuationMode.STATELESS
+    assert backend.contexts[1].session_id is None
+    assert "first turn" in backend.contexts[1].prompt
+    events = orchestrator.events.global_path.read_text(encoding="utf-8")
+    assert '"event_type":"continuation.native_resume_invalidated"' in events
+    assert '"reason":"backend_contract_changed"' in events
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_legacy_session_without_contract_fingerprint_reconstructs_after_restart(
+    tmp_path: Path, origin_repo: Path
+) -> None:
+    issue = make_issue()
+    tracker = FakeTracker(issue)
+
+    def handoff(_context, _index: int) -> None:
+        tracker.handoff(issue.id)
+
+    backend = ScriptedBackend(
+        [AgentResult(AttemptOutcome.CLEAN_EXIT, 0, "session-2", "reconstructed")],
+        on_run=handoff,
+        resume_fingerprint="contract-v1",
+    )
+    config = make_config(tmp_path, origin_repo)
+    orchestrator = build_orchestrator(config, tracker, backend)
+    orchestrator.state.save(
+        IssueState(
+            issue_id=issue.id,
+            project_id=issue.project_id,
+            iid=issue.iid,
+            identifier=issue.identifier,
+            phase=LocalPhase.READY,
+            tracker_state=issue.state,
+            tracker_labels=list(issue.labels),
+            total_attempts=1,
+            backend_session_id="legacy-session",
+            last_summary="work from before the upgrade",
+        )
+    )
+
+    await orchestrator.recover()
+    await orchestrator.tick()
+    await wait_until(lambda: len(backend.contexts) == 1 and not orchestrator.running)
+
+    assert backend.contexts[0].mode is ContinuationMode.STATELESS
+    assert backend.contexts[0].session_id is None
+    assert "work from before the upgrade" in backend.contexts[0].prompt
+    events = orchestrator.events.global_path.read_text(encoding="utf-8")
+    assert '"reason":"resume_contract_unrecorded"' in events
     await orchestrator.shutdown()
 
 

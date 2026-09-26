@@ -103,15 +103,21 @@ class ScriptedBackend(AgentBackend):
         *,
         on_run: Callable[[AttemptContext, int], Any] | None = None,
         native_resume: bool = True,
+        resume_fingerprint: str | None = None,
     ) -> None:
         self.results = results
         self.on_run = on_run
         self.native_resume = native_resume
+        self.resume_fingerprint = resume_fingerprint
         self.contexts: list[AttemptContext] = []
 
     @property
     def supports_native_resume(self) -> bool:
         return self.native_resume
+
+    @property
+    def native_resume_fingerprint(self) -> str | None:
+        return self.resume_fingerprint
 
     async def run(
         self,

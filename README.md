@@ -128,6 +128,8 @@ agent:
 
 Use `command: csc` if that is the installed executable. If the internal CLI does not expose a resumable session ID, omit `native_resume_args`; the scheduler will always use stateless reconstruction.
 
+Built-in local and SSH backends bind each observed native session ID to a SHA-256 fingerprint of the configured resume contract (command/argument templates, output/session parsing, and explicitly configured environment). If that contract changes across a continuation or scheduler restart, or an older durable state has no recorded fingerprint, the scheduler invalidates the native handle and reconstructs from GitLab plus git evidence instead of pairing an old session with new execution semantics. Custom backends can opt into the same fence by exposing `native_resume_fingerprint`.
+
 Global `repository` and `agent` values are defaults. A target may override either mapping; this is useful when the server uses `custom-claude` but an execution host exposes the same backend as `csc`.
 
 Arguments are passed with `exec`, never through a shell. Supported placeholders are `{prompt}`, `{session_id}`, `{workspace}`, `{issue_id}`, and `{attempt_id}`. The launch event redacts an argument that consists of the complete prompt.
@@ -165,7 +167,7 @@ The attempt-scoped prepare/run helpers lease themselves before remote Git or CSC
 Every event contains `event_id`, UTC `timestamp`, `event_type`, issue identity, optional `attempt_id`, and structured `details`. Important event types include:
 
 - `attempt.started`, `attempt.process_started`, `agent.output`, `agent.exited`
-- `continuation.scheduled`, `continuation.native_resume_abandoned`
+- `continuation.scheduled`, `continuation.native_resume_abandoned`, `continuation.native_resume_invalidated`
 - `retry.scheduled`
 - `reconcile.cancel_requested`
 - `cold_start.orphan_reaped`, `cold_start.orphan_reap_unconfirmed`, `cold_start.reconciled`

@@ -69,10 +69,12 @@ The clean-continuation cap is a fairness yield, not a failure: every configured 
 The scheduler selects a route per attempt:
 
 1. `first`: full workflow plus authoritative issue snapshot.
-2. `native_resume`: used only when the backend reports a session ID and the configuration supplies `native_resume_args`. It sends concise continuation guidance to the existing session.
+2. `native_resume`: used only when the backend reports a session ID, the configuration supplies `native_resume_args`, and any backend-provided resume-contract fingerprint still matches the fingerprint stored with that session. It sends concise continuation guidance to the existing session.
 3. `stateless_reconstruction`: full workflow and refreshed issue plus bounded prior output and a fresh git snapshot. The prompt tells the agent to verify the worktree rather than trust the summary.
 
-If a native-resume attempt fails, its saved session ID is cleared before retry so the next attempt takes the stateless path instead of looping on a corrupt or expired session.
+If a native-resume attempt fails, its saved session ID and resume-contract fingerprint are cleared before retry so the next attempt takes the stateless path instead of looping on a corrupt or expired session.
+
+The built-in command backends publish a versioned SHA-256 fingerprint over the configured native-session contract: command and argument templates, native-resume template, output/session-ID parsing, and explicitly configured environment. Before a saved session is resumed, the scheduler compares the current fingerprint with the value recorded when that session was observed. A mismatch, or a legacy saved session with no recorded fingerprint, invalidates the native handle and falls back to stateless reconstruction. The fingerprint is opaque control-plane evidence; it does not expose configuration values. Backends that cannot define a stable resume contract may return no fingerprint and keep the legacy opaque-session behavior.
 
 Native sessions are scoped to an execution target. When an Issue moves from one target label to another, the scheduler cancels and confirms the old executor, clears the session ID, and takes the stateless route in the new target's durable worktree.
 

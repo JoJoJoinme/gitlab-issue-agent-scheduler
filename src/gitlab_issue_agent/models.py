@@ -127,6 +127,7 @@ class IssueState:
     failure_count: int = 0
     continuation_index: int = 0
     backend_session_id: str | None = None
+    backend_resume_fingerprint: str | None = None
     process: ProcessIdentity | None = None
     next_run_at: str | None = None
     last_attempt_id: str | None = None

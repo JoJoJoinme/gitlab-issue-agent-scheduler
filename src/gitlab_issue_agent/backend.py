@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import abc
 import asyncio
+import hashlib
 import json
 import os
 import time
@@ -25,6 +26,28 @@ EmitCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 ProcessStartedCallback = Callable[[ProcessIdentity], Awaitable[None]]
 
 
+def agent_resume_fingerprint(config: AgentConfig) -> str:
+    """Return a stable hash for the configured native-resume execution contract."""
+    contract = {
+        "version": 1,
+        "command": config.command,
+        "args": list(config.args),
+        "native_resume_args": list(config.native_resume_args),
+        "prefer_native_resume": config.prefer_native_resume,
+        "output_format": config.output_format,
+        "session_id_paths": list(config.session_id_paths),
+        "pass_env": sorted(config.pass_env),
+        "env": config.env,
+    }
+    payload = json.dumps(
+        contract,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
 @dataclass(frozen=True, slots=True)
 class BackendCallbacks:
     emit: EmitCallback
@@ -35,6 +58,11 @@ class AgentBackend(abc.ABC):
     @property
     @abc.abstractmethod
     def supports_native_resume(self) -> bool: ...
+
+    @property
+    def native_resume_fingerprint(self) -> str | None:
+        """Opaque identity for a native session's execution contract, if available."""
+        return None
 
     @abc.abstractmethod
     async def run(
@@ -85,6 +113,10 @@ class CommandAgentBackend(AgentBackend):
     @property
     def supports_native_resume(self) -> bool:
         return self.config.supports_native_resume
+
+    @property
+    def native_resume_fingerprint(self) -> str | None:
+        return agent_resume_fingerprint(self.config)
 
     async def run(
         self,
