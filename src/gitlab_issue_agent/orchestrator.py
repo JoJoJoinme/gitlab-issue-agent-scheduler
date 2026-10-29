@@ -51,6 +51,15 @@ def _parse_time(value: str | None) -> datetime | None:
     return parsed
 
 
+def _has_durable_wait(local: IssueState) -> bool:
+    """A completed attempt's persisted delay survives controller restarts."""
+    return (
+        local.phase in {LocalPhase.RETRY_WAIT, LocalPhase.CONTINUATION_WAIT}
+        and local.process is None
+        and _parse_time(local.next_run_at) is not None
+    )
+
+
 class Orchestrator:
     """Single scheduling authority for dispatch, continuation, retry, and reconciliation."""
 
@@ -115,8 +124,11 @@ class Orchestrator:
                 issue = await self.tracker.get_issue(local.issue_id)
             except TrackerError as error:
                 if local.phase is not LocalPhase.BLOCKED:
-                    local.phase = LocalPhase.READY
-                local.next_run_at = None
+                    if not _has_durable_wait(local):
+                        local.phase = LocalPhase.READY
+                        local.next_run_at = None
+                else:
+                    local.next_run_at = None
                 local.last_error = f"cold-start tracker refresh failed: {error}"
                 local.recovery_count += 1
                 self.state.save(local)
@@ -129,8 +141,10 @@ class Orchestrator:
                 continue
 
             disposition = self.tracker.disposition(issue)
+            preserve_wait = disposition is IssueDisposition.ACTIVE and _has_durable_wait(local)
             local.recovery_count += 1
-            local.next_run_at = None
+            if not preserve_wait:
+                local.next_run_at = None
             if issue is not None:
                 self._refresh_local_snapshot(local, issue)
             if local.phase is LocalPhase.BLOCKED and local.last_outcome == "placement_blocked":
@@ -140,6 +154,14 @@ class Orchestrator:
                     local.last_error = None
             elif local.phase is LocalPhase.BLOCKED:
                 local.last_outcome = "executor_stop_unconfirmed"
+            elif preserve_wait:
+                # A completed attempt has no executor to reap. Restarting the
+                # scheduler must not bypass its continuation or retry delay.
+                await self.events.emit(
+                    "cold_start.wait_preserved",
+                    issue=issue,
+                    details={"phase": local.phase.value, "next_run_at": local.next_run_at},
+                )
             elif disposition is IssueDisposition.ACTIVE:
                 local.phase = LocalPhase.READY
                 local.last_outcome = "cold_start_recovered"

@@ -122,9 +122,10 @@ On cold start:
 3. For local execution, verify PID birth identity and terminate its process tree if it still matches. For SSH execution, send `cancel(attempt_id)` and require a structured `confirmed_safe` response.
 4. If stop cannot be confirmed, retain process/attempt evidence and mark `BLOCKED`; do not redispatch.
 5. Fetch the exact current GitLab Issue.
-6. If stop was confirmed and the Issue is active, mark it `READY` and reconstruct/resume from the durable worktree.
-7. If stop was confirmed and the Issue is non-active, terminal, or missing, mark it `RELEASED`.
-8. If GitLab is unavailable, do not dispatch from the stale snapshot; candidate polling must establish eligibility later.
+6. If an interrupted executor was safely reaped and the Issue is active, mark it `READY` and reconstruct/resume from the durable worktree.
+7. If the previous attempt has **already ended** and persisted a valid `RETRY_WAIT` or `CONTINUATION_WAIT` deadline, keep its original absolute `next_run_at` while the Issue remains active. Restart does not reset backoff or the continuation delay; emit `cold_start.wait_preserved`. Expired deadlines are eligible on the next poll. A missing/invalid deadline falls back to `READY`.
+8. If the Issue is non-active, terminal, or missing, mark it `RELEASED` and clear any deadline. GitLab authority always overrides a scheduled wait; uncertain executor ownership still stays `BLOCKED`.
+9. If GitLab is unavailable, do not dispatch from the stale snapshot. Retain a valid no-executor wait deadline until candidate polling establishes eligibility later.
 
 Tracker state is authoritative for whether the objective should run, but it cannot overrule uncertain executor reality: a closed Issue triggers cancellation, not an unsafe assertion that the remote process is gone. This deliberately kills the old executor even when the Issue is still active before starting a replacement, preventing duplicate writers after a scheduler `kill -9`.
 
