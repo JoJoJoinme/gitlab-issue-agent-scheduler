@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import psutil
@@ -21,7 +22,8 @@ from gitlab_issue_agent.models import (
 from gitlab_issue_agent.orchestrator import Orchestrator
 from gitlab_issue_agent.process_guard import ProcessGuard
 from gitlab_issue_agent.prompts import PromptBuilder
-from gitlab_issue_agent.state import StateStore
+from gitlab_issue_agent.state import StateStore, utc_now
+from gitlab_issue_agent.tracker import TrackerError
 from gitlab_issue_agent.workspace import WorkspaceManager
 
 
@@ -291,6 +293,133 @@ async def test_cold_start_active_issue_reaps_old_executor_then_reconstructs(
         if process.returncode is None:
             process.kill()
             await asyncio.wait_for(process.wait(), timeout=5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [LocalPhase.RETRY_WAIT, LocalPhase.CONTINUATION_WAIT])
+async def test_cold_start_preserves_wait_deadline_until_due(
+    tmp_path: Path, origin_repo: Path, phase: LocalPhase
+) -> None:
+    issue = make_issue()
+    tracker = FakeTracker(issue)
+    backend = ScriptedBackend(
+        [AgentResult(AttemptOutcome.CLEAN_EXIT, 0, None, "resumed")],
+        on_run=lambda _context, _index: tracker.handoff(issue.id),
+    )
+    orchestrator = build_orchestrator(make_config(tmp_path, origin_repo), tracker, backend)
+    deadline = (utc_now() + timedelta(minutes=10)).isoformat()
+    orchestrator.state.save(
+        IssueState(
+            issue_id=issue.id,
+            project_id=issue.project_id,
+            iid=issue.iid,
+            identifier=issue.identifier,
+            tracker_state=issue.state,
+            tracker_labels=list(issue.labels),
+            phase=phase,
+            next_run_at=deadline,
+            total_attempts=1,
+            failure_count=1 if phase is LocalPhase.RETRY_WAIT else 0,
+            last_error="earlier backend failure" if phase is LocalPhase.RETRY_WAIT else None,
+            last_summary="saved prior attempt",
+        )
+    )
+
+    await orchestrator.recover()
+    recovered = orchestrator.state.get(issue.identifier)
+    assert recovered is not None
+    assert recovered.phase is phase
+    assert recovered.next_run_at == deadline
+    assert recovered.failure_count == (1 if phase is LocalPhase.RETRY_WAIT else 0)
+    assert recovered.last_summary == "saved prior attempt"
+    await orchestrator.tick()
+    assert not backend.contexts  # restart must not skip the original deadline
+
+    # Simulate the persisted absolute deadline becoming due without sleeping.
+    recovered.next_run_at = (utc_now() - timedelta(seconds=1)).isoformat()
+    orchestrator.state.save(recovered)
+    await orchestrator.tick()
+    await wait_until(lambda: len(backend.contexts) == 1 and not orchestrator.running)
+    assert orchestrator.state.get(issue.identifier).phase is LocalPhase.RELEASED
+    events = orchestrator.events.global_path.read_text(encoding="utf-8")
+    assert '"event_type":"cold_start.wait_preserved"' in events
+    assert deadline in events
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cold_start_tracker_failure_keeps_durable_retry_deadline(
+    tmp_path: Path, origin_repo: Path
+) -> None:
+    issue = make_issue()
+
+    class TemporarilyUnavailableTracker(FakeTracker):
+        unavailable = True
+
+        async def get_issue(self, issue_id: str):
+            if self.unavailable:
+                raise TrackerError("tracker temporarily unreachable")
+            return await super().get_issue(issue_id)
+
+    tracker = TemporarilyUnavailableTracker(issue)
+    backend = ScriptedBackend([])
+    orchestrator = build_orchestrator(make_config(tmp_path, origin_repo), tracker, backend)
+    deadline = (utc_now() + timedelta(minutes=10)).isoformat()
+    orchestrator.state.save(
+        IssueState(
+            issue_id=issue.id,
+            project_id=issue.project_id,
+            iid=issue.iid,
+            identifier=issue.identifier,
+            phase=LocalPhase.RETRY_WAIT,
+            next_run_at=deadline,
+            failure_count=3,
+        )
+    )
+
+    await orchestrator.recover()
+    recovered = orchestrator.state.get(issue.identifier)
+    assert recovered is not None
+    assert recovered.phase is LocalPhase.RETRY_WAIT
+    assert recovered.next_run_at == deadline
+    assert recovered.failure_count == 3
+
+    tracker.unavailable = False
+    await orchestrator.tick()
+    assert not backend.contexts
+    await orchestrator.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", [LocalPhase.RETRY_WAIT, LocalPhase.CONTINUATION_WAIT])
+async def test_cold_start_tracker_authority_overrides_wait(
+    tmp_path: Path, origin_repo: Path, phase: LocalPhase
+) -> None:
+    issue = make_issue(labels=("agent::human-review",))
+    tracker = FakeTracker(issue)
+    backend = ScriptedBackend([])
+    orchestrator = build_orchestrator(make_config(tmp_path, origin_repo), tracker, backend)
+    orchestrator.state.save(
+        IssueState(
+            issue_id=issue.id,
+            project_id=issue.project_id,
+            iid=issue.iid,
+            identifier=issue.identifier,
+            tracker_state="opened",
+            tracker_labels=["agent::ready"],
+            phase=phase,
+            next_run_at=(utc_now() + timedelta(minutes=10)).isoformat(),
+        )
+    )
+
+    await orchestrator.recover()
+    recovered = orchestrator.state.get(issue.identifier)
+    assert recovered is not None
+    assert recovered.phase is LocalPhase.RELEASED
+    assert recovered.next_run_at is None
+    await orchestrator.tick()
+    assert not backend.contexts
+    await orchestrator.shutdown()
 
 
 @pytest.mark.asyncio
